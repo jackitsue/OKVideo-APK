@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - 'input/OKVideo-original.apk'
+      - 'input/**'
       - 'patches/**'
       - 'scripts/**'
       - '.github/workflows/build-apk.yml'
@@ -16,11 +16,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate input APK
+      - name: Prepare input APK
+        shell: bash
         run: |
-          test -f input/OKVideo-original.apk || (echo "Missing input/OKVideo-original.apk" && exit 2)
-          file input/OKVideo-original.apk
-          unzip -t input/OKVideo-original.apk >/dev/null
+          set -euo pipefail
+          mkdir -p work/input
+
+          if [ -f input/OKVideo-original.apk ]; then
+            cp input/OKVideo-original.apk work/OKVideo-original.apk
+          else
+            mapfile -t PARTS < <(find input -maxdepth 1 -type f \( -name '*.zip.0??' -o -name '*.apk.0??' -o -name '*.part0??' \) | sort)
+            if [ "${#PARTS[@]}" -eq 0 ]; then
+              echo "No APK or split parts found in input/"
+              echo "Upload split files such as *.zip.001, *.zip.002, ..."
+              exit 2
+            fi
+
+            echo "Combining split parts:"
+            printf '  %s\n' "${PARTS[@]}"
+            cat "${PARTS[@]}" > work/joined.bin
+
+            if unzip -t work/joined.bin >/dev/null 2>&1; then
+              unzip -o work/joined.bin -d work/input
+              APK_PATH=$(find work/input -type f -name '*.apk' | head -n 1 || true)
+              if [ -z "${APK_PATH}" ]; then
+                echo "Combined ZIP is valid, but no APK was found inside."
+                exit 3
+              fi
+              cp "${APK_PATH}" work/OKVideo-original.apk
+            else
+              cp work/joined.bin work/OKVideo-original.apk
+            fi
+          fi
+
+          echo "Prepared APK:"
+          ls -lh work/OKVideo-original.apk
+          file work/OKVideo-original.apk
+          unzip -t work/OKVideo-original.apk >/dev/null
 
       - name: Install Java
         uses: actions/setup-java@v4
@@ -37,16 +69,19 @@ jobs:
 
       - name: Decode APK
         run: |
-          java -jar apktool.jar d -f input/OKVideo-original.apk -o work/apk
+          java -jar apktool.jar d -f work/OKVideo-original.apk -o work/apk
 
       - name: Inspect target classes
         run: |
           grep -RIl "DownloadActivity" work/apk/smali* > work/download_refs.txt || true
           grep -RIl "VodFragment" work/apk/smali* > work/vod_refs.txt || true
+          grep -RIl "Episode" work/apk/smali* > work/episode_refs.txt || true
           echo "Download refs:"
           cat work/download_refs.txt || true
           echo "Vod refs:"
           cat work/vod_refs.txt || true
+          echo "Episode refs:"
+          cat work/episode_refs.txt || true
 
       - name: Apply patch
         run: |
@@ -75,4 +110,5 @@ jobs:
             work/OKVideo-download.apk
             work/download_refs.txt
             work/vod_refs.txt
+            work/episode_refs.txt
           if-no-files-found: error
