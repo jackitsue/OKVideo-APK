@@ -180,7 +180,9 @@ jobs:
       - name: Upload installable APK
         uses: actions/upload-artifact@v4
         with:
-          name: OKVideo-download-APK-v2
+          name: OKVideo-install-diagnostics-v3
           path: |
             work/OKVideo-download-v2.apk
+            work/OKVideo-control-resigned.apk
+            work/package-diagnostics.txt
           if-no-files-found: error
