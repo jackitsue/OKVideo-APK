@@ -6,7 +6,14 @@ root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("work/apk")
 if not root.exists():
     raise SystemExit("decoded APK directory not found")
 
-smali = root / "smali_classes3"
+if (root / "smali_classes3").exists():
+    smali = root / "smali_classes3"
+elif (root / "com").exists():
+    # DEX-only workflow: root is the disassembled classes3.dex directory.
+    smali = root
+else:
+    raise SystemExit("Unable to locate classes3 smali tree")
+
 base = smali / "com/fongmi/android/tv"
 iface = base / "ui/adapter/EpisodeAdapter$oOoOoOoOoOoOoO0o.smali"
 episode_fragment = base / "ui/fragment/EpisodeFragment.smali"
@@ -159,11 +166,14 @@ for path in holders:
     s = s.replace(needle, needle + extra, 1)
     write(path, s)
 
-marker = root / "assets" / "okvideo_patch_status.txt"
-marker.parent.mkdir(parents=True, exist_ok=True)
-marker.write_text(
-    "OKVideo patch: tap an episode to play; long-press an episode to download using the app's built-in downloader.\n",
-    encoding="utf-8",
-)
+# Only add an informational marker when operating on a full apktool tree.
+# In the DEX-only workflow, non-smali files must not be placed in the smali tree.
+if (root / "AndroidManifest.xml").exists():
+    marker = root / "assets" / "okvideo_patch_status.txt"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(
+        "OKVideo patch: tap an episode to play; long-press an episode to download using the app's built-in downloader.\n",
+        encoding="utf-8",
+    )
 
 print("OKVideo download patch applied successfully")
