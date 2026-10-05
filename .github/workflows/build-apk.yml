@@ -27,32 +27,24 @@ jobs:
           else
             mapfile -t PARTS < <(find input . -maxdepth 1 -type f \( -name '*.zip.0??' -o -name '*.apk.0??' -o -name '*.part0??' \) | sort -V)
             if [ "${#PARTS[@]}" -eq 0 ]; then
-              echo "No APK or split parts found in repository root or input/"
-              echo "Upload split files such as *.zip.001, *.zip.002, ..."
+              echo "No APK or split parts found"
               exit 2
             fi
-
-            echo "Combining split parts:"
-            printf '  %s\n' "${PARTS[@]}"
             cat "${PARTS[@]}" > work/joined.bin
-
             if unzip -t work/joined.bin >/dev/null 2>&1; then
               unzip -o work/joined.bin -d work/input
               APK_PATH=$(find work/input -type f -name '*.apk' | head -n 1 || true)
-              if [ -z "${APK_PATH}" ]; then
-                echo "Combined ZIP is valid, but no APK was found inside."
-                exit 3
-              fi
+              test -n "${APK_PATH}" || exit 3
               cp "${APK_PATH}" work/OKVideo-original.apk
             else
               cp work/joined.bin work/OKVideo-original.apk
             fi
           fi
 
-          echo "Prepared APK:"
-          ls -lh work/OKVideo-original.apk
-          file work/OKVideo-original.apk
           unzip -t work/OKVideo-original.apk >/dev/null
+          unzip -p work/OKVideo-original.apk classes3.dex > work/classes3-original.dex
+          test -s work/classes3-original.dex
+          sha256sum work/OKVideo-original.apk work/classes3-original.dex
 
       - name: Install Java
         uses: actions/setup-java@v5
@@ -62,7 +54,6 @@ jobs:
 
       - name: Prepare Android build tools
         run: |
-          echo "ANDROID_HOME=$ANDROID_HOME"
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "build-tools;35.0.0"
 
@@ -70,79 +61,126 @@ jobs:
         run: |
           curl -L --fail -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar
 
-      - name: Decode APK (DEX only, preserve original resources)
+      - name: Decode APK for smali patch
         run: |
-          java -jar apktool.jar d -f -r work/OKVideo-original.apk -o work/apk
+          java -jar apktool.jar d -f work/OKVideo-original.apk -o work/apk
 
-      - name: Inspect target classes
-        run: |
-          grep -RIl "DownloadActivity" work/apk/smali* > work/download_refs.txt || true
-          grep -RIl "VodFragment" work/apk/smali* > work/vod_refs.txt || true
-          grep -RIl "Episode" work/apk/smali* > work/episode_refs.txt || true
-          grep -RIn -C 12 "DownloadActivity" work/apk/smali* > work/download_context.txt || true
-          grep -RIn -C 12 "Episode" work/apk/smali*/com/fongmi/android/tv/ui 2>/dev/null > work/episode_context.txt || true
-          mkdir -p work/targets
-          while IFS= read -r p; do [ -f "$p" ] && cp --parents "$p" work/targets/; done < work/download_refs.txt
-          while IFS= read -r p; do [ -f "$p" ] && cp --parents "$p" work/targets/; done < work/vod_refs.txt
-          while IFS= read -r p; do [ -f "$p" ] && cp --parents "$p" work/targets/; done < work/episode_refs.txt
-          tar -czf work/target-smali.tar.gz -C work/targets . || true
-          echo "Download refs:"; cat work/download_refs.txt || true
-          echo "Vod refs:"; cat work/vod_refs.txt || true
-          echo "Episode refs:"; cat work/episode_refs.txt || true
-
-      - name: Upload inspection data
-        uses: actions/upload-artifact@v4
-        with:
-          name: OKVideo-smali-inspection
-          path: |
-            work/download_refs.txt
-            work/vod_refs.txt
-            work/episode_refs.txt
-            work/download_context.txt
-            work/episode_context.txt
-            work/target-smali.tar.gz
-          if-no-files-found: warn
-
-      - name: Apply patch
+      - name: Apply download patch
         run: |
           python3 scripts/apply_patch.py work/apk
 
-      - name: Rebuild with original resource package preserved
+      - name: Build temporary APK to assemble patched DEX
         run: |
-          java -jar apktool.jar b work/apk -o work/OKVideo-unsigned.apk
-          unzip -p work/OKVideo-original.apk AndroidManifest.xml > work/original-manifest.bin
-          unzip -p work/OKVideo-unsigned.apk AndroidManifest.xml > work/rebuilt-manifest.bin
-          {
-            echo "Original APK:"
-            sha256sum work/OKVideo-original.apk
-            echo
-            echo "Manifest comparison:"
-            wc -c work/original-manifest.bin work/rebuilt-manifest.bin
-            sha256sum work/original-manifest.bin work/rebuilt-manifest.bin
-          } > work/install-diagnostics.txt
+          java -jar apktool.jar b work/apk -o work/temporary-rebuilt.apk
+          unzip -p work/temporary-rebuilt.apk classes3.dex > work/classes3-patched.dex
+          test -s work/classes3-patched.dex
+          sha256sum work/classes3-original.dex work/classes3-patched.dex
+
+      - name: Verify only target DEX will be replaced
+        run: |
+          python3 - <<'PY'
+          import zipfile, hashlib, sys
+          from pathlib import Path
+
+          orig = Path("work/OKVideo-original.apk")
+          rebuilt = Path("work/temporary-rebuilt.apk")
+          target = "classes3.dex"
+
+          with zipfile.ZipFile(orig) as a, zipfile.ZipFile(rebuilt) as b:
+              assert target in a.namelist() and target in b.namelist()
+              print("Original classes3:", len(a.read(target)))
+              print("Patched classes3 :", len(b.read(target)))
+          PY
+
+      - name: Inject patched classes3.dex into original APK
+        run: |
+          python3 - <<'PY'
+          import zipfile
+          from pathlib import Path
+
+          src = Path("work/OKVideo-original.apk")
+          dex = Path("work/classes3-patched.dex")
+          out = Path("work/OKVideo-patched-unsigned.apk")
+
+          # Keep every original entry byte-for-byte where possible, replacing only
+          # classes3.dex and removing the old v1 signature files before re-signing.
+          remove = {
+              "META-INF/CERT.SF",
+              "META-INF/CERT.RSA",
+              "META-INF/CERT.DSA",
+              "META-INF/MANIFEST.MF",
+          }
+
+          with zipfile.ZipFile(src, "r") as zin, zipfile.ZipFile(out, "w", allowZip64=True) as zout:
+              for info in zin.infolist():
+                  if info.filename in remove or info.filename == "classes3.dex":
+                      continue
+                  data = zin.read(info.filename)
+                  zi = zipfile.ZipInfo(info.filename, info.date_time)
+                  zi.compress_type = info.compress_type
+                  zi.comment = info.comment
+                  zi.extra = info.extra
+                  zi.internal_attr = info.internal_attr
+                  zi.external_attr = info.external_attr
+                  zi.create_system = info.create_system
+                  zi.flag_bits = info.flag_bits & ~0x08
+                  zout.writestr(zi, data)
+
+              old = zin.getinfo("classes3.dex")
+              zi = zipfile.ZipInfo("classes3.dex", old.date_time)
+              zi.compress_type = old.compress_type
+              zi.external_attr = old.external_attr
+              zi.create_system = old.create_system
+              zout.writestr(zi, dex.read_bytes())
+
+          print(out, out.stat().st_size)
+          PY
+
+          unzip -t work/OKVideo-patched-unsigned.apk >/dev/null
 
       - name: Create signing key
         run: |
-          keytool -genkeypair -v -keystore work/debug.keystore -storepass android -alias androiddebugkey -keypass android -dname "CN=OKVideo Debug,O=Local,C=TW" -keyalg RSA -keysize 2048 -validity 10000
+          keytool -genkeypair -v             -keystore work/debug.keystore             -storepass android             -alias androiddebugkey             -keypass android             -dname "CN=OKVideo Debug,O=Local,C=TW"             -keyalg RSA -keysize 2048 -validity 10000
 
-      - name: Align and sign
+      - name: Align and sign preserved APK
         run: |
           BUILD_TOOLS="$ANDROID_HOME/build-tools/35.0.0"
-          "$BUILD_TOOLS/zipalign" -f -p 4 work/OKVideo-unsigned.apk work/OKVideo-aligned.apk
-          "$BUILD_TOOLS/apksigner" sign --ks work/debug.keystore --ks-pass pass:android --key-pass pass:android --out work/OKVideo-download.apk work/OKVideo-aligned.apk
-          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs work/OKVideo-download.apk | tee -a work/install-diagnostics.txt
-          echo >> work/install-diagnostics.txt
-          echo "APK summary:" >> work/install-diagnostics.txt
-          "$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" apk summary work/OKVideo-download.apk >> work/install-diagnostics.txt || true
+          "$BUILD_TOOLS/zipalign" -f -p 4 work/OKVideo-patched-unsigned.apk work/OKVideo-aligned.apk
+          "$BUILD_TOOLS/apksigner" sign             --ks work/debug.keystore             --ks-pass pass:android             --key-pass pass:android             --v1-signing-enabled true             --v2-signing-enabled true             --v3-signing-enabled true             --out work/OKVideo-download-v2.apk             work/OKVideo-aligned.apk
 
-      - name: Upload APK and inspection logs
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs work/OKVideo-download-v2.apk
+          unzip -t work/OKVideo-download-v2.apk >/dev/null
+
+      - name: Compare preserved package entries
+        run: |
+          python3 - <<'PY'
+          import zipfile, hashlib
+
+          orig = zipfile.ZipFile("work/OKVideo-original.apk")
+          new = zipfile.ZipFile("work/OKVideo-download-v2.apk")
+          excluded = {"classes3.dex", "META-INF/CERT.SF", "META-INF/CERT.RSA", "META-INF/CERT.DSA", "META-INF/MANIFEST.MF"}
+
+          mismatches=[]
+          for name in orig.namelist():
+              if name in excluded or name.startswith("META-INF/ANDROIDD."):
+                  continue
+              if name not in new.namelist():
+                  mismatches.append(("missing", name))
+                  continue
+              if hashlib.sha256(orig.read(name)).digest() != hashlib.sha256(new.read(name)).digest():
+                  mismatches.append(("changed", name))
+
+          print("Unexpected changed/missing original entries:", len(mismatches))
+          for x in mismatches[:50]:
+              print(x)
+          if mismatches:
+              raise SystemExit(1)
+          PY
+
+      - name: Upload installable APK
         uses: actions/upload-artifact@v4
         with:
-          name: OKVideo-download-APK
+          name: OKVideo-download-APK-v2
           path: |
-            work/OKVideo-download.apk
-            work/download_refs.txt
-            work/vod_refs.txt
-            work/episode_refs.txt
-            work/install-diagnostics.txt
+            work/OKVideo-download-v2.apk
           if-no-files-found: error
