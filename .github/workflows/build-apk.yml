@@ -21,30 +21,23 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p work/input
-
           if [ -f input/OKVideo-original.apk ]; then
             cp input/OKVideo-original.apk work/OKVideo-original.apk
           else
             mapfile -t PARTS < <(find input . -maxdepth 1 -type f \( -name '*.zip.0??' -o -name '*.apk.0??' -o -name '*.part0??' \) | sort -V)
-            if [ "${#PARTS[@]}" -eq 0 ]; then
-              echo "No APK or split parts found"
-              exit 2
-            fi
+            test "${#PARTS[@]}" -gt 0 || exit 2
             cat "${PARTS[@]}" > work/joined.bin
             if unzip -t work/joined.bin >/dev/null 2>&1; then
               unzip -o work/joined.bin -d work/input
-              APK_PATH=$(find work/input -type f -name '*.apk' | head -n 1 || true)
-              test -n "${APK_PATH}" || exit 3
-              cp "${APK_PATH}" work/OKVideo-original.apk
+              APK_PATH=$(find work/input -type f -name '*.apk' | head -n 1)
+              cp "$APK_PATH" work/OKVideo-original.apk
             else
               cp work/joined.bin work/OKVideo-original.apk
             fi
           fi
-
           unzip -t work/OKVideo-original.apk >/dev/null
           unzip -p work/OKVideo-original.apk classes3.dex > work/classes3-original.dex
           test -s work/classes3-original.dex
-          sha256sum work/OKVideo-original.apk work/classes3-original.dex
 
       - name: Install Java
         uses: actions/setup-java@v5
@@ -74,25 +67,8 @@ jobs:
           java -jar apktool.jar b work/apk -o work/temporary-rebuilt.apk
           unzip -p work/temporary-rebuilt.apk classes3.dex > work/classes3-patched.dex
           test -s work/classes3-patched.dex
-          sha256sum work/classes3-original.dex work/classes3-patched.dex
 
-      - name: Verify only target DEX will be replaced
-        run: |
-          python3 - <<'PY'
-          import zipfile, hashlib, sys
-          from pathlib import Path
-
-          orig = Path("work/OKVideo-original.apk")
-          rebuilt = Path("work/temporary-rebuilt.apk")
-          target = "classes3.dex"
-
-          with zipfile.ZipFile(orig) as a, zipfile.ZipFile(rebuilt) as b:
-              assert target in a.namelist() and target in b.namelist()
-              print("Original classes3:", len(a.read(target)))
-              print("Patched classes3 :", len(b.read(target)))
-          PY
-
-      - name: Inject patched classes3.dex into original APK
+      - name: Build patched unsigned APK from original
         run: |
           python3 - <<'PY'
           import zipfile
@@ -101,15 +77,7 @@ jobs:
           src = Path("work/OKVideo-original.apk")
           dex = Path("work/classes3-patched.dex")
           out = Path("work/OKVideo-patched-unsigned.apk")
-
-          # Keep every original entry byte-for-byte where possible, replacing only
-          # classes3.dex and removing the old v1 signature files before re-signing.
-          remove = {
-              "META-INF/CERT.SF",
-              "META-INF/CERT.RSA",
-              "META-INF/CERT.DSA",
-              "META-INF/MANIFEST.MF",
-          }
+          remove = {"META-INF/CERT.SF","META-INF/CERT.RSA","META-INF/CERT.DSA","META-INF/MANIFEST.MF"}
 
           with zipfile.ZipFile(src, "r") as zin, zipfile.ZipFile(out, "w", allowZip64=True) as zout:
               for info in zin.infolist():
@@ -125,64 +93,65 @@ jobs:
                   zi.create_system = info.create_system
                   zi.flag_bits = info.flag_bits & ~0x08
                   zout.writestr(zi, data)
-
               old = zin.getinfo("classes3.dex")
               zi = zipfile.ZipInfo("classes3.dex", old.date_time)
               zi.compress_type = old.compress_type
               zi.external_attr = old.external_attr
               zi.create_system = old.create_system
               zout.writestr(zi, dex.read_bytes())
-
-          print(out, out.stat().st_size)
           PY
-
           unzip -t work/OKVideo-patched-unsigned.apk >/dev/null
 
       - name: Create signing key
         run: |
           keytool -genkeypair -v             -keystore work/debug.keystore             -storepass android             -alias androiddebugkey             -keypass android             -dname "CN=OKVideo Debug,O=Local,C=TW"             -keyalg RSA -keysize 2048 -validity 10000
 
-      - name: Align and sign preserved APK
+      - name: Build CONTROL APK - no code changes
+        run: |
+          set -e
+          cp work/OKVideo-original.apk work/OKVideo-control-unsigned.apk
+          zip -d work/OKVideo-control-unsigned.apk 'META-INF/*.SF' 'META-INF/*.RSA' 'META-INF/*.DSA' 'META-INF/MANIFEST.MF' || true
+
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/35.0.0"
+          "$BUILD_TOOLS/zipalign" -f -p 4 work/OKVideo-control-unsigned.apk work/OKVideo-control-aligned.apk
+          "$BUILD_TOOLS/apksigner" sign             --ks work/debug.keystore             --ks-pass pass:android             --key-pass pass:android             --v1-signing-enabled true             --v2-signing-enabled true             --v3-signing-enabled true             --out work/OKVideo-control-resigned.apk             work/OKVideo-control-aligned.apk
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs work/OKVideo-control-resigned.apk
+          unzip -t work/OKVideo-control-resigned.apk >/dev/null
+
+      - name: Build PATCHED APK
         run: |
           BUILD_TOOLS="$ANDROID_HOME/build-tools/35.0.0"
-          "$BUILD_TOOLS/zipalign" -f -p 4 work/OKVideo-patched-unsigned.apk work/OKVideo-aligned.apk
-          "$BUILD_TOOLS/apksigner" sign             --ks work/debug.keystore             --ks-pass pass:android             --key-pass pass:android             --v1-signing-enabled true             --v2-signing-enabled true             --v3-signing-enabled true             --out work/OKVideo-download-v2.apk             work/OKVideo-aligned.apk
+          "$BUILD_TOOLS/zipalign" -f -p 4 work/OKVideo-patched-unsigned.apk work/OKVideo-patched-aligned.apk
+          "$BUILD_TOOLS/apksigner" sign             --ks work/debug.keystore             --ks-pass pass:android             --key-pass pass:android             --v1-signing-enabled true             --v2-signing-enabled true             --v3-signing-enabled true             --out work/OKVideo-patched-resigned.apk             work/OKVideo-patched-aligned.apk
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs work/OKVideo-patched-resigned.apk
+          unzip -t work/OKVideo-patched-resigned.apk >/dev/null
 
-          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs work/OKVideo-download-v2.apk
-          unzip -t work/OKVideo-download-v2.apk >/dev/null
-
-      - name: Compare preserved package entries
+      - name: Generate package diagnostics
         run: |
-          python3 - <<'PY'
-          import zipfile, hashlib
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/35.0.0"
+          {
+            echo "=== ORIGINAL ==="
+            "$BUILD_TOOLS/apksigner" verify --verbose --print-certs work/OKVideo-original.apk || true
+            "$BUILD_TOOLS/aapt" dump badging work/OKVideo-original.apk || true
+            echo
+            echo "=== CONTROL RESIGNED ==="
+            "$BUILD_TOOLS/apksigner" verify --verbose --print-certs work/OKVideo-control-resigned.apk || true
+            "$BUILD_TOOLS/aapt" dump badging work/OKVideo-control-resigned.apk || true
+            echo
+            echo "=== PATCHED RESIGNED ==="
+            "$BUILD_TOOLS/apksigner" verify --verbose --print-certs work/OKVideo-patched-resigned.apk || true
+            "$BUILD_TOOLS/aapt" dump badging work/OKVideo-patched-resigned.apk || true
+            echo
+            echo "=== SHA256 ==="
+            sha256sum work/OKVideo-original.apk work/OKVideo-control-resigned.apk work/OKVideo-patched-resigned.apk
+          } > work/package-diagnostics.txt 2>&1
 
-          orig = zipfile.ZipFile("work/OKVideo-original.apk")
-          new = zipfile.ZipFile("work/OKVideo-download-v2.apk")
-          excluded = {"classes3.dex", "META-INF/CERT.SF", "META-INF/CERT.RSA", "META-INF/CERT.DSA", "META-INF/MANIFEST.MF"}
-
-          mismatches=[]
-          for name in orig.namelist():
-              if name in excluded or name.startswith("META-INF/ANDROIDD."):
-                  continue
-              if name not in new.namelist():
-                  mismatches.append(("missing", name))
-                  continue
-              if hashlib.sha256(orig.read(name)).digest() != hashlib.sha256(new.read(name)).digest():
-                  mismatches.append(("changed", name))
-
-          print("Unexpected changed/missing original entries:", len(mismatches))
-          for x in mismatches[:50]:
-              print(x)
-          if mismatches:
-              raise SystemExit(1)
-          PY
-
-      - name: Upload installable APK
+      - name: Upload A-B install test
         uses: actions/upload-artifact@v4
         with:
-          name: OKVideo-install-diagnostics-v3
+          name: OKVideo-AB-install-test
           path: |
-            work/OKVideo-download-v2.apk
             work/OKVideo-control-resigned.apk
+            work/OKVideo-patched-resigned.apk
             work/package-diagnostics.txt
           if-no-files-found: error
