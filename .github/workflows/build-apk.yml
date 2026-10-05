@@ -25,9 +25,9 @@ jobs:
           if [ -f input/OKVideo-original.apk ]; then
             cp input/OKVideo-original.apk work/OKVideo-original.apk
           else
-            mapfile -t PARTS < <(find input -maxdepth 1 -type f \( -name '*.zip.0??' -o -name '*.apk.0??' -o -name '*.part0??' \) | sort)
+            mapfile -t PARTS < <(find input . -maxdepth 1 -type f \( -name '*.zip.0??' -o -name '*.apk.0??' -o -name '*.part0??' \) | sort -V)
             if [ "${#PARTS[@]}" -eq 0 ]; then
-              echo "No APK or split parts found in input/"
+              echo "No APK or split parts found in repository root or input/"
               echo "Upload split files such as *.zip.001, *.zip.002, ..."
               exit 2
             fi
