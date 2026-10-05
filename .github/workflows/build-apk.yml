@@ -70,9 +70,9 @@ jobs:
         run: |
           curl -L --fail -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar
 
-      - name: Decode APK
+      - name: Decode APK (DEX only, preserve original resources)
         run: |
-          java -jar apktool.jar d -f work/OKVideo-original.apk -o work/apk
+          java -jar apktool.jar d -f -r work/OKVideo-original.apk -o work/apk
 
       - name: Inspect target classes
         run: |
@@ -107,9 +107,19 @@ jobs:
         run: |
           python3 scripts/apply_patch.py work/apk
 
-      - name: Rebuild
+      - name: Rebuild with original resource package preserved
         run: |
           java -jar apktool.jar b work/apk -o work/OKVideo-unsigned.apk
+          unzip -p work/OKVideo-original.apk AndroidManifest.xml > work/original-manifest.bin
+          unzip -p work/OKVideo-unsigned.apk AndroidManifest.xml > work/rebuilt-manifest.bin
+          {
+            echo "Original APK:"
+            sha256sum work/OKVideo-original.apk
+            echo
+            echo "Manifest comparison:"
+            wc -c work/original-manifest.bin work/rebuilt-manifest.bin
+            sha256sum work/original-manifest.bin work/rebuilt-manifest.bin
+          } > work/install-diagnostics.txt
 
       - name: Create signing key
         run: |
@@ -120,7 +130,10 @@ jobs:
           BUILD_TOOLS="$ANDROID_HOME/build-tools/35.0.0"
           "$BUILD_TOOLS/zipalign" -f -p 4 work/OKVideo-unsigned.apk work/OKVideo-aligned.apk
           "$BUILD_TOOLS/apksigner" sign --ks work/debug.keystore --ks-pass pass:android --key-pass pass:android --out work/OKVideo-download.apk work/OKVideo-aligned.apk
-          "$BUILD_TOOLS/apksigner" verify --verbose work/OKVideo-download.apk
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs work/OKVideo-download.apk | tee -a work/install-diagnostics.txt
+          echo >> work/install-diagnostics.txt
+          echo "APK summary:" >> work/install-diagnostics.txt
+          "$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" apk summary work/OKVideo-download.apk >> work/install-diagnostics.txt || true
 
       - name: Upload APK and inspection logs
         uses: actions/upload-artifact@v4
@@ -131,4 +144,5 @@ jobs:
             work/download_refs.txt
             work/vod_refs.txt
             work/episode_refs.txt
+            work/install-diagnostics.txt
           if-no-files-found: error
