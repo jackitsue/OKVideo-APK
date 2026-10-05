@@ -55,13 +55,16 @@ jobs:
           unzip -t work/OKVideo-original.apk >/dev/null
 
       - name: Install Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Install Android SDK tools
-        uses: android-actions/setup-android@v3
+      - name: Prepare Android build tools
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "build-tools;35.0.0"
 
       - name: Download apktool
         run: |
@@ -76,12 +79,29 @@ jobs:
           grep -RIl "DownloadActivity" work/apk/smali* > work/download_refs.txt || true
           grep -RIl "VodFragment" work/apk/smali* > work/vod_refs.txt || true
           grep -RIl "Episode" work/apk/smali* > work/episode_refs.txt || true
-          echo "Download refs:"
-          cat work/download_refs.txt || true
-          echo "Vod refs:"
-          cat work/vod_refs.txt || true
-          echo "Episode refs:"
-          cat work/episode_refs.txt || true
+          grep -RIn -C 12 "DownloadActivity" work/apk/smali* > work/download_context.txt || true
+          grep -RIn -C 12 "Episode" work/apk/smali*/com/fongmi/android/tv/ui 2>/dev/null > work/episode_context.txt || true
+          mkdir -p work/targets
+          while IFS= read -r p; do [ -f "$p" ] && cp --parents "$p" work/targets/; done < work/download_refs.txt
+          while IFS= read -r p; do [ -f "$p" ] && cp --parents "$p" work/targets/; done < work/vod_refs.txt
+          while IFS= read -r p; do [ -f "$p" ] && cp --parents "$p" work/targets/; done < work/episode_refs.txt
+          tar -czf work/target-smali.tar.gz -C work/targets . || true
+          echo "Download refs:"; cat work/download_refs.txt || true
+          echo "Vod refs:"; cat work/vod_refs.txt || true
+          echo "Episode refs:"; cat work/episode_refs.txt || true
+
+      - name: Upload inspection data
+        uses: actions/upload-artifact@v4
+        with:
+          name: OKVideo-smali-inspection
+          path: |
+            work/download_refs.txt
+            work/vod_refs.txt
+            work/episode_refs.txt
+            work/download_context.txt
+            work/episode_context.txt
+            work/target-smali.tar.gz
+          if-no-files-found: warn
 
       - name: Apply patch
         run: |
@@ -97,7 +117,7 @@ jobs:
 
       - name: Align and sign
         run: |
-          BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/35.0.0"
           "$BUILD_TOOLS/zipalign" -f -p 4 work/OKVideo-unsigned.apk work/OKVideo-aligned.apk
           "$BUILD_TOOLS/apksigner" sign --ks work/debug.keystore --ks-pass pass:android --key-pass pass:android --out work/OKVideo-download.apk work/OKVideo-aligned.apk
           "$BUILD_TOOLS/apksigner" verify --verbose work/OKVideo-download.apk
