@@ -1,0 +1,78 @@
+name: Build patched APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'input/OKVideo-original.apk'
+      - 'patches/**'
+      - 'scripts/**'
+      - '.github/workflows/build-apk.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate input APK
+        run: |
+          test -f input/OKVideo-original.apk || (echo "Missing input/OKVideo-original.apk" && exit 2)
+          file input/OKVideo-original.apk
+          unzip -t input/OKVideo-original.apk >/dev/null
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK tools
+        uses: android-actions/setup-android@v3
+
+      - name: Download apktool
+        run: |
+          curl -L --fail -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar
+
+      - name: Decode APK
+        run: |
+          java -jar apktool.jar d -f input/OKVideo-original.apk -o work/apk
+
+      - name: Inspect target classes
+        run: |
+          grep -RIl "DownloadActivity" work/apk/smali* > work/download_refs.txt || true
+          grep -RIl "VodFragment" work/apk/smali* > work/vod_refs.txt || true
+          echo "Download refs:"
+          cat work/download_refs.txt || true
+          echo "Vod refs:"
+          cat work/vod_refs.txt || true
+
+      - name: Apply patch
+        run: |
+          python3 scripts/apply_patch.py work/apk
+
+      - name: Rebuild
+        run: |
+          java -jar apktool.jar b work/apk -o work/OKVideo-unsigned.apk
+
+      - name: Create signing key
+        run: |
+          keytool -genkeypair -v -keystore work/debug.keystore -storepass android -alias androiddebugkey -keypass android -dname "CN=OKVideo Debug,O=Local,C=TW" -keyalg RSA -keysize 2048 -validity 10000
+
+      - name: Align and sign
+        run: |
+          BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          "$BUILD_TOOLS/zipalign" -f -p 4 work/OKVideo-unsigned.apk work/OKVideo-aligned.apk
+          "$BUILD_TOOLS/apksigner" sign --ks work/debug.keystore --ks-pass pass:android --key-pass pass:android --out work/OKVideo-download.apk work/OKVideo-aligned.apk
+          "$BUILD_TOOLS/apksigner" verify --verbose work/OKVideo-download.apk
+
+      - name: Upload APK and inspection logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: OKVideo-download-APK
+          path: |
+            work/OKVideo-download.apk
+            work/download_refs.txt
+            work/vod_refs.txt
+          if-no-files-found: error
